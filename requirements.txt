@@ -1,0 +1,4 @@
+mcp[cli]>=1.10,<2
+pypdfium2
+python-docx
+requests

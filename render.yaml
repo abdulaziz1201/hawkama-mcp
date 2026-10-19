@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hawkama-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /
+    envVars:
+      - key: FOLDER_ID
+        value: 1BXhhu7AqzbrtUnRz48KjZUKBQW4phwId
+      - key: PYTHON_VERSION
+        value: 3.12.7
