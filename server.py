@@ -5,8 +5,10 @@ MCP الحوكمة — يقرأ ملفات مجلد عام في Google Drive (PD
 - ما يحتاج مفتاح API: يكفي أن يكون المجلد "أي شخص لديه الرابط ← عارض".
 - أي ملف تضيفه للمجلد يظهر تلقائياً بعد التحديث الدوري (افتراضياً كل 6 ساعات).
 """
+import gzip
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -143,33 +145,76 @@ def load_one(item: dict) -> dict:
 
 
 # ───────────── الفهرس في الذاكرة + تحديث دوري ─────────────
-STATE = {"docs": [], "loaded_at": 0.0, "error": None}
+# الفهرس يُبنى وقت النشر (Build) ويُحفظ في ملف، عشان التشغيل يكون فوري حتى بعد "نوم" الخدمة المجانية.
+# بعد التشغيل، الخادم يضيف الملفات الجديدة فقط (تحديث خفيف) عشان ما يثقل على المعالج.
+INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.json.gz")
+STATE = {"docs": [], "loaded_at": 0.0, "error": None, "source": None}
 READY = threading.Event()
+SAVED_KEYS = ("id", "title", "category", "kind", "url", "pages", "error", "scanned")
 
 
-def build_index():
+def save_index(docs: list[dict]):
+    with gzip.open(INDEX_FILE, "wt", encoding="utf-8") as f:
+        json.dump([{k: d[k] for k in SAVED_KEYS} for d in docs], f, ensure_ascii=False)
+
+
+def load_index() -> bool:
+    if not os.path.exists(INDEX_FILE):
+        return False
+    with gzip.open(INDEX_FILE, "rt", encoding="utf-8") as f:
+        docs = json.load(f)
+    for d in docs:
+        d["norm_pages"] = [norm(p) for p in d["pages"]]
+    STATE.update(docs=docs, loaded_at=os.path.getmtime(INDEX_FILE), source="build")
+    READY.set()
+    log.info("تم تحميل الفهرس الجاهز: %d ملف", len(docs))
+    return True
+
+
+def build_index(workers: int = 1) -> list[dict]:
     t0 = time.time()
     items = crawl(FOLDER_ID)
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         docs = list(pool.map(load_one, items))
-    STATE.update(docs=docs, loaded_at=time.time(), error=None)
+    STATE.update(docs=docs, loaded_at=time.time(), error=None, source="live")
     READY.set()
     log.info("تم تحميل %d ملف في %.0f ثانية", len(docs), time.time() - t0)
+    return docs
+
+
+def incremental_refresh():
+    """يضيف الملفات الجديدة ويحذف المحذوفة ويحدّث الأسماء، بدون إعادة قراءة كل شيء."""
+    items = crawl(FOLDER_ID)
+    current = {d["id"]: d for d in STATE["docs"]}
+    docs = []
+    for it in items:
+        d = current.get(it["id"])
+        if d is None or d.get("error"):
+            d = load_one(it)
+            time.sleep(0.5)  # نترك المعالج يتنفس عشان الطلبات ما تتأخر
+        else:
+            d = dict(d, title=it["title"], category=it["category"])
+        docs.append(d)
+    added = len([i for i in items if i["id"] not in current])
+    STATE.update(docs=docs, loaded_at=time.time(), error=None)
+    log.info("تحديث: %d ملف (%d جديد)", len(docs), added)
 
 
 def refresher():
-    while True:
+    if not load_index():
         try:
-            build_index()
+            build_index(workers=1)
         except Exception as e:
             STATE["error"] = str(e)
             log.exception("فشل التحميل")
-            time.sleep(60)
-            continue
+    time.sleep(120)  # ننتظر شوي بعد التشغيل قبل أول تحديث
+    while True:
+        try:
+            incremental_refresh()
+        except Exception as e:
+            STATE["error"] = str(e)
+            log.exception("فشل التحديث")
         time.sleep(REFRESH_HOURS * 3600)
-
-
-threading.Thread(target=refresher, daemon=True).start()
 
 
 def docs_or_wait() -> list[dict] | str:
@@ -298,9 +343,15 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse({
         "name": SERVER_NAME, "ready": READY.is_set(), "documents": len(STATE["docs"]),
         "loaded_at": time.strftime("%Y-%m-%d %H:%M", time.gmtime(STATE["loaded_at"])) if STATE["loaded_at"] else None,
-        "mcp_endpoint": "/mcp", "error": STATE["error"],
+        "source": STATE["source"], "mcp_endpoint": "/mcp", "error": STATE["error"],
     })
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import sys
+    if "--build" in sys.argv:
+        # يُستدعى وقت النشر: يبني الفهرس ويحفظه في ملف ثم يخرج
+        save_index(build_index(workers=6))
+    else:
+        threading.Thread(target=refresher, daemon=True).start()
+        mcp.run(transport="streamable-http")
